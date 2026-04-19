@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/Enamel_Brooch.png" alt="GeoSAR-Forge logo" width="180">
+</p>
+
 # GeoSAR-Forge
 
 GeoSAR-Forge is a Sentinel-1 PS/DS-InSAR processing and forecasting project for automated ground-deformation monitoring.  
