@@ -1,0 +1,59 @@
+flowchart TB
+    subgraph S1["Stage 1 主 InSAR 反演链"]
+        direction LR
+        A["AOI / 场景筛选<br/>时间均匀采样 + 基线约束"] --> B["大气方案选择<br/>GACOS / ERA5 / MERRA-2 / 纯算法"]
+        B --> C["DEM 准备"]
+        C --> D["SLC 下载"]
+        D --> E["ISCE2<br/>几何配准 / 合并 / 裁剪"]
+        E --> F["Dolphin<br/>PS/DS phase linking + SNAPHU 解缠"]
+        F --> G["主链 QC<br/>pair_qc.csv + ifgramStack_qc.h5"]
+        F --> H["DePSI-like QC<br/>ps_score / strict-relaxed / ref network / date_qc"]
+        G --> I["MintPy pass1"]
+        H --> I
+        I --> J["strict PS 群体残差反馈<br/>global / mixed / local 异常日期"]
+        J --> K["MintPy pass2"]
+        K --> L{"pass2 接受?"}
+        L -->|是| M["最终接受结果 = pass2"]
+        L -->|否| N["最终接受结果 = pass1"]
+        M --> O["可视化与导出<br/>full_coverage + high_confidence"]
+        N --> O
+    end
+
+    subgraph S2["Stage 2 support_graph_v1 区域识别"]
+        direction LR
+        P["高可信点支持图<br/>strict∪relaxed"] --> P1["支持点特征<br/>net / peak / trend / PCA / qc_support / saliency"]
+        P1 --> P2["图生长<br/>同号 + corr>=0.58 + d<=max(4.5×NN,0.10km)"]
+        P2 --> P3["候选区评分<br/>internal corr / temporal coherence / boundary contrast / region score"]
+        P3 --> P4["outward growth 到 MintPy 栅格<br/>polygon + 区域级累计形变曲线"]
+    end
+
+    subgraph S3["Stage 3 MintPy 后未来预测 v2"]
+        direction LR
+        Q["预测数据层<br/>robust_harmonic_v1 + 邻域统计 + 事件特征"] --> Q1["点集选择<br/>strict_only / strict_plus_relaxed / baseline_only"]
+        Q --> Q2["默认范围<br/>all_high_confidence<br/>zone 仅作附加字段"]
+        Q --> Q3["预测邻域图<br/>graph_k=8 + edge features"]
+
+        Q3 --> R["generic 候选模型"]
+        R --> R1["TemporalFusionForecaster<br/>time encoding + self-attention + neighbor context"]
+        R --> R2["DecompTCNGRUQuantileForecaster<br/>TCN(long) + GRU(short) + gate fusion"]
+        R1 --> S["generic canonical model<br/>validation MAE 择优"]
+        R2 --> S
+
+        Q3 --> T["hazard 模式<br/>GraphTCNAttnQuantileForecaster"]
+        T --> T1["edge-aware neighbor aggregation<br/>+ TCN + temporal attention"]
+        T1 --> U{"hazard 结构与验证是否通过?"}
+        U -->|是| V["active_model = hazard"]
+        U -->|否| W["fallback / active_model = generic"]
+
+        S --> X["分位数训练<br/>p10 / p50 / p90 + monotonic penalty"]
+        V --> X
+        W --> X
+        X --> Y["CQR conformal 校准<br/>target coverage = 0.80"]
+        Y --> Z["forecast_predictions.h5<br/>calibrated pred + raw pred + c_pred"]
+        Z --> Z1["评估<br/>baseline / generic / hazard / active_model"]
+        Z --> Z2["图件<br/>confidence / horizon / calibration / explainability"]
+    end
+
+    O --> P
+    O --> Q
+    P4 -. zone metadata .-> Q
