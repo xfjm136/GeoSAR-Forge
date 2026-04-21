@@ -10,11 +10,13 @@ import requests
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict, OrderedDict
+from itertools import combinations
 
 import asf_search as asf
 from geopy.geocoders import Nominatim
 from shapely.geometry import box, shape, MultiPolygon, Polygon
 from shapely.ops import unary_union
+from shapely import wkt as shapely_wkt
 from tqdm.auto import tqdm
 
 from .config import logger, require_config_vars
@@ -335,14 +337,26 @@ def search_scenes(aoi_wkt, date_range, flight_direction="DESCENDING"):
         key = (r.properties.get("pathNumber"), r.properties.get("frameNumber"))
         groups[key].append(r)
 
-    best_key = max(groups, key=lambda k: len(groups[k]))
-    best = groups[best_key]
-    best.sort(key=lambda r: r.properties["startTime"])
+    aoi_bounds = None
+    try:
+        geom = shapely_wkt.loads(aoi_wkt)
+        minx, miny, maxx, maxy = geom.bounds
+        aoi_bounds = (minx, miny, maxx, maxy)  # W, S, E, N
+    except Exception:
+        aoi_bounds = None
+
+    best_key, best = _choose_best_path_frame_combo(groups, aoi_bounds)
 
     print(f"共找到 {len(results)} 景, {len(groups)} 个 Path/Frame 组合")
-    print(f"选定 Path={best_key[0]}, Frame={best_key[1]} "
-          f"({len(best)} 景, {best[0].properties['startTime'][:10]} "
-          f"~ {best[-1].properties['startTime'][:10]})")
+    frame_label = (
+        "+".join(str(f) for f in best_key[1])
+        if isinstance(best_key[1], (list, tuple))
+        else str(best_key[1])
+    )
+    unique_dates = sorted({_scene_date(s) for s in best})
+    print(f"选定 Path={best_key[0]}, Frame={frame_label} "
+          f"({len(unique_dates)} 日期, {len(best)} 景, "
+          f"{unique_dates[0]} ~ {unique_dates[-1]})")
 
     print(f"\n{'Path':>6} {'Frame':>6} {'景数':>6}  时间范围")
     for k in sorted(groups, key=lambda k: -len(groups[k]))[:5]:
@@ -350,6 +364,10 @@ def search_scenes(aoi_wkt, date_range, flight_direction="DESCENDING"):
         print(f"{k[0]:>6} {k[1]:>6} {len(g):>6}  "
               f"{g[0].properties['startTime'][:10]} ~ "
               f"{g[-1].properties['startTime'][:10]}")
+
+    if isinstance(best_key[1], (list, tuple)) and len(best_key[1]) > 1:
+        print("\n[INFO] AOI 跨越多个 frame，已自动组合相邻 frame 并仅保留共同日期。")
+        print(f"       选用 frame 组合: {frame_label}")
 
     return best
 
@@ -367,13 +385,22 @@ def uniform_temporal_sample(scenes, target_n):
     3. 贪心: 每个时隙选时间最近+基线偏差最小的场景
     4. 强制包含首尾场景
     """
-    if len(scenes) <= target_n:
-        print(f"总景数 ({len(scenes)}) ≤ 目标 ({target_n})，全部使用。")
-        return scenes
+    scenes_sorted = sorted(
+        scenes,
+        key=lambda r: (r.properties["startTime"], r.properties.get("frameNumber", 0)),
+    )
+    date_groups = OrderedDict()
+    for scene in scenes_sorted:
+        date_groups.setdefault(_scene_date(scene), []).append(scene)
+    unique_dates = list(date_groups.keys())
 
-    scenes_sorted = sorted(scenes, key=lambda r: r.properties["startTime"])
+    if len(unique_dates) <= target_n:
+        print(f"总日期数 ({len(unique_dates)}) ≤ 目标 ({target_n})，全部使用。")
+        return scenes_sorted
 
     def parse_date(s):
+        if isinstance(s, str):
+            return datetime.fromisoformat(f"{s}T00:00:00")
         return datetime.fromisoformat(s.properties["startTime"][:19])
 
     def get_baseline(s):
@@ -393,8 +420,9 @@ def uniform_temporal_sample(scenes, target_n):
         # asf_search 搜索结果不含基线信息 (需要 baseline API 单独计算)
         return None
 
-    dates = [parse_date(s) for s in scenes_sorted]
-    baselines = [get_baseline(s) for s in scenes_sorted]
+    date_representatives = [date_groups[d][0] for d in unique_dates]
+    dates = [parse_date(d) for d in unique_dates]
+    baselines = [get_baseline(s) for s in date_representatives]
     # 过滤 None 基线，无基线信息时仅按时间采样
     has_baseline = any(b is not None for b in baselines)
     baselines_num = [b if b is not None else 0.0 for b in baselines]
@@ -403,7 +431,7 @@ def uniform_temporal_sample(scenes, target_n):
     start_dt, end_dt = dates[0], dates[-1]
     interval = (end_dt - start_dt) / (target_n - 1)
 
-    selected_indices = {0, len(scenes_sorted) - 1}
+    selected_indices = {0, len(unique_dates) - 1}
 
     for i in range(1, target_n - 1):
         ideal_time = start_dt + interval * i
@@ -420,15 +448,118 @@ def uniform_temporal_sample(scenes, target_n):
         if best_idx is not None:
             selected_indices.add(best_idx)
 
-    selected = [scenes_sorted[i] for i in sorted(selected_indices)]
-    print(f"\n均匀采样: {len(scenes_sorted)} → {len(selected)} 景 "
-          f"(间隔 ~{interval.days} 天)")
-    for s in selected:
-        dt = s.properties["startTime"][:10]
-        bl = get_baseline(s)
+    selected_dates = [unique_dates[i] for i in sorted(selected_indices)]
+    selected = []
+    for d in selected_dates:
+        selected.extend(date_groups[d])
+
+    print(f"\n均匀采样: {len(unique_dates)} → {len(selected_dates)} 日期 "
+          f"(输出 {len(selected)} 景, 间隔 ~{interval.days} 天)")
+    for d in selected_dates:
+        rep = date_groups[d][0]
+        bl = get_baseline(rep)
+        n_frame = len(date_groups[d])
         bl_str = f"Bperp={bl:+7.1f}m" if bl is not None else "Bperp=N/A"
-        print(f"  {dt}  {bl_str}")
+        extra = f"  frames={n_frame}" if n_frame > 1 else ""
+        print(f"  {d}  {bl_str}{extra}")
     return selected
+
+
+def _scene_date(scene):
+    return scene.properties["startTime"][:10]
+
+
+def _scene_bounds(scene):
+    try:
+        geom = shape(scene.geometry)
+        return geom.bounds
+    except Exception:
+        return None
+
+
+def _union_bounds_for_scenes(scenes):
+    bounds = [_scene_bounds(s) for s in scenes]
+    bounds = [b for b in bounds if b is not None]
+    if not bounds:
+        return None
+    west = min(b[0] for b in bounds)
+    south = min(b[1] for b in bounds)
+    east = max(b[2] for b in bounds)
+    north = max(b[3] for b in bounds)
+    return (west, south, east, north)
+
+
+def _bounds_cover(aoi_bounds, candidate_bounds, *, tol=0.02):
+    if aoi_bounds is None or candidate_bounds is None:
+        return False
+    aoi_w, aoi_s, aoi_e, aoi_n = aoi_bounds
+    cand_w, cand_s, cand_e, cand_n = candidate_bounds
+    return (
+        cand_s <= aoi_s + tol
+        and cand_n >= aoi_n - tol
+        and cand_w <= aoi_w + tol
+        and cand_e >= aoi_e - tol
+    )
+
+
+def _choose_best_path_frame_combo(groups, aoi_bounds):
+    meta = {}
+    for key, scenes in groups.items():
+        scenes_sorted = sorted(scenes, key=lambda r: r.properties["startTime"])
+        meta[key] = {
+            "scenes": scenes_sorted,
+            "dates": {_scene_date(s) for s in scenes_sorted},
+            "bounds": _union_bounds_for_scenes(scenes_sorted),
+        }
+
+    combos = []
+    by_path = defaultdict(list)
+    for (path, frame) in groups:
+        by_path[path].append(frame)
+
+    for path, frames in by_path.items():
+        frames = sorted(set(frames))
+        frame_keys = [(path, frame) for frame in frames]
+        max_combo = min(3, len(frame_keys))
+        for size in range(1, max_combo + 1):
+            for combo in combinations(frame_keys, size):
+                date_sets = [meta[key]["dates"] for key in combo]
+                common_dates = set.intersection(*date_sets) if date_sets else set()
+                if not common_dates:
+                    continue
+                scenes = []
+                for key in combo:
+                    scenes.extend(
+                        [s for s in meta[key]["scenes"] if _scene_date(s) in common_dates]
+                    )
+                scenes.sort(
+                    key=lambda r: (r.properties["startTime"], r.properties.get("frameNumber", 0))
+                )
+                combos.append({
+                    "path": path,
+                    "frames": tuple(key[1] for key in combo),
+                    "covers": _bounds_cover(aoi_bounds, _union_bounds_for_scenes(scenes)),
+                    "n_dates": len(common_dates),
+                    "n_scenes": len(scenes),
+                    "scenes": scenes,
+                })
+
+    if not combos:
+        best_key = max(groups, key=lambda k: len(groups[k]))
+        best = sorted(groups[best_key], key=lambda r: r.properties["startTime"])
+        return best_key, best
+
+    combos.sort(
+        key=lambda c: (
+            1 if c["covers"] else 0,
+            c["n_dates"],
+            -len(c["frames"]),
+            c["n_scenes"],
+        ),
+        reverse=True,
+    )
+    best = combos[0]
+    return (best["path"], best["frames"]), best["scenes"]
 
 
 # ---------------------------------------------------------------------------

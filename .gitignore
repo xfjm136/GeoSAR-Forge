@@ -12,6 +12,8 @@ backups/
 reports/
 *.log
 *.zip
+.fuse_hidden*
+pipeline copy.ipynb
 
 __pycache__/
 *.py[cod]

@@ -10,6 +10,7 @@ import subprocess
 import zipfile
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import xml.etree.ElementTree as ET
 
 from tqdm.auto import tqdm
 
@@ -203,6 +204,26 @@ def generate_stack(slc_dir=None, dem_path=None, orbit_dir=None, work_dir=None,
     needed_swaths = None
     if bbox:
         needed_swaths = _detect_swaths_for_bbox(slc_dir, bbox)
+        overlap = _estimate_safe_overlap_bbox(slc_dir)
+        if overlap is not None:
+            if (
+                float(bbox[0]) < float(overlap["S"])
+                or float(bbox[1]) > float(overlap["N"])
+                or float(bbox[2]) < float(overlap["W"])
+                or float(bbox[3]) > float(overlap["E"])
+            ):
+                raise RuntimeError(
+                    "当前 AOI bbox 超出所选 Sentinel-1 SAFE 栈的公共覆盖范围。\n"
+                    f"AOI: S={float(bbox[0]):.4f}, N={float(bbox[1]):.4f}, "
+                    f"W={float(bbox[2]):.4f}, E={float(bbox[3]):.4f}\n"
+                    f"SAFE 公共覆盖: S={float(overlap['S']):.4f}, N={float(overlap['N']):.4f}, "
+                    f"W={float(overlap['W']):.4f}, E={float(overlap['E']):.4f}\n"
+                    "这通常意味着两种情况之一：\n"
+                    "1. 当前 notebook 里的 `bounds` 变量仍是上一个项目/上一个 AOI 的残留值；\n"
+                    "2. 当前行政区或手工 bbox 超出了单个 Path/Frame 栈的完整覆盖范围。\n"
+                    "建议先重新运行 AOI/场景筛选单元，确认 `bounds` 已刷新；"
+                    "若仍报此错，请缩小 AOI，或改用更小的行政区/手工 bbox。"
+                )
 
     run_dir = work_dir / "run_files"
     existing_runs = sorted(run_dir.glob("run_*")) if run_dir.exists() else []
@@ -265,6 +286,18 @@ def generate_stack(slc_dir=None, dem_path=None, orbit_dir=None, work_dir=None,
     if result.returncode != 0:
         err_msg = result.stderr.strip() or result.stdout.strip() or "(无输出)"
         logger.error(f"stackSentinel.py 失败:\nstdout: {result.stdout}\nstderr: {result.stderr}")
+        if "No acquisition fulfills the temporal range and bbox requirement." in err_msg:
+            n_safe = len(sorted(Path(slc_dir).glob("*.SAFE")))
+            extra = ""
+            if n_safe <= 5:
+                extra = (
+                    f"\n当前仅检测到 {n_safe} 景 SAFE。对年度时序而言，这通常过少，"
+                    "建议把 `target_scenes` 提高到至少 8-10 景后重新选片与下载。"
+                )
+            raise RuntimeError(
+                "stackSentinel.py 失败：没有 acquisition 同时满足当前 bbox 与时间约束。"
+                f"{extra}\n原始输出:\n{err_msg[:800]}"
+            )
         raise RuntimeError(f"stackSentinel.py 失败:\n{err_msg[:800]}")
 
     logger.info(f"stackSentinel.py stdout:\n{result.stdout}")
@@ -354,7 +387,6 @@ def _detect_swaths_for_bbox(slc_dir, bbox):
     Returns:
         list[int]: 如 [2] 或 [1, 2], 失败时返回 None (使用默认全部 swath)
     """
-    import xml.etree.ElementTree as ET
     from shapely.geometry import box as shapely_box, Polygon
 
     slc_dir = Path(slc_dir)
@@ -396,6 +428,59 @@ def _detect_swaths_for_bbox(slc_dir, bbox):
         return None
 
     return needed
+
+
+def _estimate_safe_overlap_bbox(slc_dir):
+    """
+    读取 SAFE annotation XML，估算所有日期共同覆盖的经纬度边界。
+
+    返回:
+        {"S","N","W","E","n_dates"} 或 None
+    """
+    slc_dir = Path(slc_dir)
+    safe_dirs = sorted(slc_dir.glob("*.SAFE"))
+    if not safe_dirs:
+        return None
+
+    south_list = []
+    north_list = []
+    west_list = []
+    east_list = []
+
+    for safe in safe_dirs:
+        ann_files = sorted((safe / "annotation").glob("s1?-iw*-slc-vv-*.xml"))
+        lats = []
+        lons = []
+        for ann in ann_files:
+            try:
+                root = ET.parse(str(ann)).getroot()
+            except Exception as exc:
+                logger.warning(f"读取 annotation 失败 {ann}: {exc}")
+                continue
+            points = root.findall(".//geolocationGridPoint")
+            for p in points:
+                try:
+                    lats.append(float(p.find("latitude").text))
+                    lons.append(float(p.find("longitude").text))
+                except Exception:
+                    continue
+        if not lats or not lons:
+            continue
+        south_list.append(min(lats))
+        north_list.append(max(lats))
+        west_list.append(min(lons))
+        east_list.append(max(lons))
+
+    if not south_list:
+        return None
+
+    return {
+        "S": max(south_list),
+        "N": min(north_list),
+        "W": max(west_list),
+        "E": min(east_list),
+        "n_dates": len(south_list),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -829,7 +829,16 @@ def _compute_bperp_for_ifgrams(date_pairs, geom_source):
                 continue
 
     if not bperp_abs:
-        logger.warning("baselines/ 目录中未找到有效基线文件，bperp 全部设为 0")
+        merged_bl_dir = isce_work / "merged" / "baselines"
+        if (not pair_bl_dir.exists()) and merged_bl_dir.exists():
+            logger.warning(
+                "未找到 %s 中的星型基线文本，但检测到 %s 仍存在。"
+                "这通常表示自动清理过早删除了 isce2/baselines；当前只能将 bperp 退化为 0。",
+                pair_bl_dir,
+                merged_bl_dir,
+            )
+        else:
+            logger.warning("baselines/ 目录中未找到有效基线文件，bperp 全部设为 0")
         return np.zeros(len(date_pairs), dtype='float32')
 
     # 确保所有日期都有 bperp（ISCE2 参考景 bperp=0）

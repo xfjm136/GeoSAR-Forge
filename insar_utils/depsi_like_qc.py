@@ -165,6 +165,71 @@ def _write_like_tif(path: Path, array: np.ndarray, ref_path: Path, *, dtype: str
     return path
 
 
+def _average_raster_stack(paths: list[Path], output_path: Path) -> Path:
+    if not paths:
+        raise ValueError("平均栅格栈不能为空。")
+    ref_path = paths[0]
+    sum_arr = None
+    count_arr = None
+    for path in paths:
+        arr, _ = _read_tif(path)
+        arr = np.asarray(arr, dtype=np.float32)
+        finite = np.isfinite(arr)
+        if sum_arr is None:
+            sum_arr = np.zeros_like(arr, dtype=np.float64)
+            count_arr = np.zeros_like(arr, dtype=np.float32)
+        sum_arr[finite] += arr[finite]
+        count_arr[finite] += 1.0
+    mean = np.full_like(sum_arr, np.nan, dtype=np.float32)
+    valid = count_arr > 0
+    mean[valid] = (sum_arr[valid] / count_arr[valid]).astype(np.float32)
+    mean = np.clip(mean, 0.0, 1.0)
+    return _write_like_tif(output_path, mean, ref_path, dtype="float32", nodata=np.nan)
+
+
+def _resolve_temporal_coherence_path(dolphin_dir: Path, report_dir: Path) -> Path:
+    inter_dir = dolphin_dir / "interferograms"
+    linked_dir = dolphin_dir / "phase_linking" / "linked_phase"
+
+    avg_in_inter = sorted(inter_dir.glob("temporal_coherence_average_*.tif"))
+    if avg_in_inter:
+        return max(avg_in_inter, key=lambda p: p.stat().st_mtime)
+
+    avg_in_linked = sorted(linked_dir.glob("temporal_coherence_average_*.tif"))
+    if avg_in_linked:
+        src = max(avg_in_linked, key=lambda p: p.stat().st_mtime)
+        dst = inter_dir / src.name
+        inter_dir.mkdir(parents=True, exist_ok=True)
+        if not dst.exists():
+            shutil.copy2(src, dst)
+        return dst
+
+    per_stack_tcoh = sorted(linked_dir.glob("temporal_coherence_*.tif"))
+    if per_stack_tcoh:
+        out = inter_dir / "temporal_coherence_average_from_linked_phase.tif"
+        return _average_raster_stack(per_stack_tcoh, out)
+
+    cor_stack = sorted(inter_dir.glob("*.int.cor.tif"))
+    if cor_stack:
+        out = inter_dir / "temporal_coherence_average_from_cor_stack.tif"
+        logger.warning(
+            "未找到 temporal_coherence_average_*.tif，回退为对 *.int.cor.tif 求平均: %s",
+            out,
+        )
+        return _average_raster_stack(cor_stack, out)
+
+    checked = [
+        str(inter_dir / "temporal_coherence_average_*.tif"),
+        str(linked_dir / "temporal_coherence_average_*.tif"),
+        str(linked_dir / "temporal_coherence_*.tif"),
+        str(inter_dir / "*.int.cor.tif"),
+    ]
+    raise FileNotFoundError(
+        "未找到 DePSI-like QC 所需的 temporal coherence 栅格，且无法从干涉相干栈回退生成。"
+        f" 已检查: {checked}. 若此前开启了自动清理，请重新运行 Dolphin 单元后再继续。"
+    )
+
+
 def _date_pairs_from_dolphin(dolphin_dir: Path) -> list[tuple[str, str]]:
     pairs = []
     for path in sorted((dolphin_dir / "unwrapped").glob("*.unw.tif")):
@@ -989,12 +1054,17 @@ def run_depsi_like_qc(
     cfg_like = dict(DEPSI_LIKE_DEFAULTS)
     cfg_like.update(config or {})
 
-    tcoh_path = max(
-        (dolphin_dir / "interferograms").glob("temporal_coherence_average_*.tif"),
-        key=lambda p: p.stat().st_mtime,
-    )
+    tcoh_path = _resolve_temporal_coherence_path(dolphin_dir, report_dir)
     ps_mask_path = dolphin_dir / "interferograms" / "ps_mask_looked.tif"
+    if not ps_mask_path.exists():
+        alt = dolphin_dir / "phase_linking" / "PS" / "ps_pixels_looked.tif"
+        if alt.exists():
+            ps_mask_path = alt
     amp_disp_path = dolphin_dir / "interferograms" / "amp_dispersion_looked.tif"
+    if not amp_disp_path.exists():
+        alt = dolphin_dir / "phase_linking" / "PS" / "amp_dispersion_looked.tif"
+        if alt.exists():
+            amp_disp_path = alt
     velocity_path = dolphin_dir / "timeseries" / "velocity.tif"
 
     tcoh, _ = _read_tif(tcoh_path)

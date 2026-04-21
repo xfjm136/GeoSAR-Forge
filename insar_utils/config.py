@@ -7,6 +7,7 @@ import sys
 import json
 import shutil
 import logging
+import time
 from pathlib import Path
 from glob import glob
 
@@ -410,20 +411,74 @@ def cleanup_temp():
 def cleanup_after_step(step_name, force=False):
     """
     分步清理中间数据。仅在 auto_cleanup 开启或 force=True 时执行。
+
+    注意:
+      - ``after_dolphin`` 只清理体积较大的 wrapped interferograms / scratch 文件，
+        不再删除 ``phase_linking``。后续的 pre-MintPy QC 仍需要其中的
+        temporal coherence / PS 辅助栅格。
+      - ``after_isce2`` 不再删除 ``isce2/baselines``。Dolphin→MintPy 桥接阶段仍要
+        读取星型基线文本来恢复 ``bperp``；这些文件延后到 ``after_hdf5_bridge`` 再删。
+      - ``after_hdf5_bridge`` 发生在 Dolphin→MintPy HDF5 桥接完成之后，
+        此时才允许整体移除 ``dolphin_work``，并回收 ``isce2/baselines``。
     """
     if not force and not _AUTO_CLEANUP:
         return
 
     freed = 0
 
+    def _dir_size_bytes(d: Path) -> int:
+        total = 0
+        for f in d.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                total += f.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def _list_dir_entries(d: Path):
+        try:
+            return list(d.iterdir())
+        except OSError:
+            return []
+
+    def _has_only_fuse_hidden_files(d: Path) -> bool:
+        entries = _list_dir_entries(d)
+        return bool(entries) and all(p.name.startswith(".fuse_hidden") for p in entries)
+
     def _rm_dir(d, label=""):
         nonlocal freed
         d = Path(d)
         if d.exists() and d.is_dir():
-            size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
-            shutil.rmtree(d)
-            freed += size
-            logger.info(f"清理 {label or d.name}: {size/1e9:.1f} GB")
+            size = _dir_size_bytes(d)
+            last_err = None
+            for attempt in range(3):
+                try:
+                    shutil.rmtree(d)
+                    freed += size
+                    logger.info(f"清理 {label or d.name}: {size/1e9:.1f} GB")
+                    return
+                except OSError as exc:
+                    last_err = exc
+                    if not d.exists():
+                        freed += size
+                        logger.info(f"清理 {label or d.name}: {size/1e9:.1f} GB")
+                        return
+                    if _has_only_fuse_hidden_files(d):
+                        leftovers = ", ".join(p.name for p in _list_dir_entries(d))
+                        logger.warning(
+                            "清理 %s 时仅剩 FUSE 占位文件，暂缓删除并继续流程: %s",
+                            label or d.name,
+                            leftovers,
+                        )
+                        logger.warning(
+                            "这通常表示文件句柄尚未释放，不是中间产物被误删；稍后可再次执行 cleanup_after_step()。"
+                        )
+                        return
+                    if attempt < 2:
+                        time.sleep(1.0 + attempt)
+            raise last_err
 
     def _rm_glob(parent, pattern, label=""):
         nonlocal freed
@@ -447,7 +502,7 @@ def cleanup_after_step(step_name, force=False):
             _rm_glob(SLC_ZIP_DIR, "*.zip", "SLC ZIPs")
         elif step == "after_isce2":
             _rm_glob(ISCE_SLC_DIR, "*.SAFE", "SAFE dirs")
-            for sub in ["baselines", "stack", "configs", "run_files", "aux_cal"]:
+            for sub in ["stack", "configs", "run_files", "aux_cal"]:
                 _rm_dir(ISCE_WORK_DIR / sub)
         elif step == "after_postprocess":
             merged_slc = ISCE_WORK_DIR / "merged" / "SLC"
@@ -461,10 +516,11 @@ def cleanup_after_step(step_name, force=False):
             if coreg.is_symlink():
                 coreg.unlink()
         elif step == "after_dolphin":
-            _rm_dir(DOLPHIN_DIR / "phase_linking", "phase_linking")
             _rm_glob(DOLPHIN_DIR / "interferograms", "*.int.tif", "wrapped ifgrams")
+            _rm_dir(DOLPHIN_DIR / "unwrapped" / "scratch", "unwrapped scratch")
         elif step == "after_hdf5_bridge":
             _rm_dir(DOLPHIN_DIR, "dolphin_work")
+            _rm_dir(ISCE_WORK_DIR / "baselines", "ISCE baselines")
             merged_slc = ISCE_WORK_DIR / "merged" / "SLC"
             if merged_slc.exists():
                 _rm_glob(merged_slc, "*/*.slc.tif", "SLC TIFs")
